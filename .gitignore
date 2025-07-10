@@ -1,3 +1,6 @@
 processed_data/
 raw_data/
 venv/
+__pycache__/
+wandb/
+checkpoints/
