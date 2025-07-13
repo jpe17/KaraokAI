@@ -1,6 +1,86 @@
+# Data directories
 processed_data/
 raw_data/
-venv/
-__pycache__/
-wandb/
+
+# Demucs pipeline data (keep scripts, exclude data)
+demucs_crepe_pipeline/00_data/
+demucs_crepe_pipeline/01_demucs/
+demucs_crepe_pipeline/02_data_augment/
+demucs_crepe_pipeline/03_data_preprocessing/
+demucs_crepe_pipeline/04_extracted_notes/
+
+# Model artifacts
 checkpoints/
+logs/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints
+
+# Audio/Video files (except examples)
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+!frontend/midify.png
+!frontend/karaoke.png
+
+# Temporary files
+frontend/temp_audio/
+*.tmp
+*.temp
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pkl
+*.pickle

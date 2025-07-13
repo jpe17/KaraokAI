@@ -10,6 +10,7 @@ from tqdm import tqdm
 import argparse
 from datetime import datetime
 import time
+import torch.nn.functional as F # Added for focal loss
 
 from model import VoiceToNotesModel
 from dataloader import create_dataloaders
@@ -106,31 +107,33 @@ class WandbManager:
         self.local_logger = local_logger
         self.online = False
         self.offline_mode = offline_mode
+        self.wandb_initialized = False
         
         if offline_mode:
             print("🔄 Starting in offline mode - will sync to wandb later")
-            os.environ["WANDB_MODE"] = "offline"
+            self.wandb_initialized = False
+            return
         
         try:
-            wandb.init(project=project_name, config=config)
+            wandb.init(project=project_name, config=config, settings=wandb.Settings(init_timeout=10))
             self.online = True
+            self.wandb_initialized = True
             print("✅ Connected to wandb online")
         except Exception as e:
             print(f"⚠️  Could not connect to wandb: {e}")
-            print("📱 Running in offline mode - logs will be saved locally")
+            print("📱 Running without wandb - logs will be saved locally only")
             self.online = False
-            # Switch to offline mode
-            os.environ["WANDB_MODE"] = "offline"
-            wandb.init(project=project_name, config=config)
+            self.wandb_initialized = False
     
     def log(self, metrics, step=None, commit=True):
         """Log metrics to wandb and/or local logger"""
-        try:
-            wandb.log(metrics, step=step, commit=commit)
-            if not self.online:
-                print("📝 Logged to wandb offline cache")
-        except Exception as e:
-            print(f"⚠️  wandb logging failed: {e}")
+        if self.wandb_initialized:
+            try:
+                wandb.log(metrics, step=step, commit=commit)
+                if not self.online:
+                    print("📝 Logged to wandb offline cache")
+            except Exception as e:
+                print(f"⚠️  wandb logging failed: {e}")
         
         # Always log locally as backup
         if self.local_logger:
@@ -138,10 +141,11 @@ class WandbManager:
     
     def finish(self):
         """Finish wandb run"""
-        try:
-            wandb.finish()
-        except Exception as e:
-            print(f"Warning: Could not finish wandb run: {e}")
+        if self.wandb_initialized:
+            try:
+                wandb.finish()
+            except Exception as e:
+                print(f"Warning: Could not finish wandb run: {e}")
     
     def sync_offline_runs(self):
         """Sync offline wandb runs (call this when back online)"""
@@ -167,7 +171,8 @@ class VoiceToNotesTrainer:
                  warmup_steps=1000,
                  max_grad_norm=1.0,
                  wandb_manager=None,
-                 local_logger=None):
+                 local_logger=None,
+                 gradient_accumulation_steps=1):  # NEW: Gradient accumulation
         
         self.model = model
         self.train_dataloader = train_dataloader
@@ -176,48 +181,61 @@ class VoiceToNotesTrainer:
         self.max_grad_norm = max_grad_norm
         self.wandb_manager = wandb_manager
         self.local_logger = local_logger
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
         # Move model to device
         self.model.to(device)
         
-        # Optimizer with different learning rates for different parts
+        # IMPROVED: Better optimizer configuration
         whisper_param_ids = {id(p) for p in self.model.whisper.parameters()}
-        other_params = [p for p in self.model.parameters() if id(p) not in whisper_param_ids]
-        whisper_params = [p for p in self.model.parameters() if id(p) in whisper_param_ids]
+        other_params = [p for p in self.model.parameters() if id(p) not in whisper_param_ids if p.requires_grad]
+        whisper_params = [p for p in self.model.parameters() if id(p) in whisper_param_ids if p.requires_grad]
         
+        # Increase learning rates and reduce weight decay for better convergence
         self.optimizer = optim.AdamW([
-            {'params': whisper_params, 'lr': lr * 0.05},  # Even lower LR for pretrained Whisper
-            {'params': other_params, 'lr': lr * 0.5}  # Reduced LR for other params too
-        ], weight_decay=weight_decay * 2)  # Increased weight decay
+            {'params': whisper_params, 'lr': lr * 0.1, 'weight_decay': weight_decay * 0.5},  # Higher LR for Whisper
+            {'params': other_params, 'lr': lr, 'weight_decay': weight_decay}  # Standard LR for other parts
+        ], betas=(0.9, 0.98), eps=1e-6)  # Better beta values for Transformer training
         
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.OneCycleLR(
+        # IMPROVED: More aggressive learning rate scheduler for faster convergence
+        total_steps = len(train_dataloader) * 50 // gradient_accumulation_steps  # Estimate total steps
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            max_lr=lr,
-            steps_per_epoch=len(train_dataloader),
-            epochs=100,  # Will be updated based on actual training
-            pct_start=0.1
+            T_0=total_steps // 10,  # Restart every 10% of training
+            T_mult=1,
+            eta_min=lr * 0.01,  # Minimum LR
+            last_epoch=-1
         )
         
-        # Loss functions with label smoothing to reduce overfitting
-        self.note_loss_fn = nn.CrossEntropyLoss(ignore_index=model.pad_token, label_smoothing=0.1)
-        self.time_loss_fn = nn.CrossEntropyLoss(ignore_index=model.pad_token, label_smoothing=0.1)
-        self.duration_loss_fn = nn.CrossEntropyLoss(ignore_index=model.pad_token, label_smoothing=0.1)
+        # IMPROVED: Focal loss for better handling of class imbalance
+        self.note_loss_fn = self.focal_loss  # Use focal loss instead of CrossEntropy
+        self.time_loss_fn = nn.CrossEntropyLoss(ignore_index=model.pad_token, label_smoothing=0.05)  # Reduced label smoothing
+        self.duration_loss_fn = nn.CrossEntropyLoss(ignore_index=model.pad_token, label_smoothing=0.05)
         
-        # Metrics tracking
+        # Metrics tracking with better early stopping
         self.train_losses = []
         self.val_losses = []
         self.best_val_loss = float('inf')
+        self.best_note_accuracy = 0.0  # NEW: Track best accuracy too
+        self.patience_counter = 0
+        self.min_improvement = 0.001  # Minimum improvement to reset patience
         
+    def focal_loss(self, logits, targets, alpha=1.0, gamma=2.0):
+        """Focal loss for better handling of class imbalance"""
+        ce_loss = F.cross_entropy(logits, targets, ignore_index=self.model.pad_token, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = alpha * (1 - pt) ** gamma * ce_loss
+        return focal_loss.mean()
+    
     def prepare_batch(self, batch):
         """Prepare batch for training with data augmentation"""
         audio_features = batch['audio_features'].to(self.device)
         notes_list = batch['notes']
         
-        # Apply audio augmentation during training
-        if self.model.training:
-            # Add small amount of noise to audio features
-            noise = torch.randn_like(audio_features) * 0.01
+        # IMPROVED: Less aggressive audio augmentation
+        if self.model.training and np.random.random() < 0.3:
+            # Add very small amount of noise to audio features (reduced)
+            noise = torch.randn_like(audio_features) * 0.005
             audio_features = audio_features + noise
         
         # Tokenize notes for each sample in batch
@@ -225,10 +243,10 @@ class VoiceToNotesTrainer:
         max_len = 0
         
         for notes in notes_list:
-            # Apply note sequence augmentation during training
-            if self.model.training and len(notes) > 2 and np.random.random() < 0.3:
-                # Randomly drop 10% of notes for robustness
-                keep_indices = np.random.choice(len(notes), int(len(notes) * 0.9), replace=False)
+            # IMPROVED: Less aggressive data augmentation
+            if self.model.training and len(notes) > 4 and np.random.random() < 0.15:
+                # Randomly drop 5% of notes for robustness (reduced from 10%)
+                keep_indices = np.random.choice(len(notes), int(len(notes) * 0.95), replace=False)
                 notes = [notes[i] for i in sorted(keep_indices)]
             
             tokens = self.model.tokenize_notes(notes)
@@ -246,11 +264,8 @@ class VoiceToNotesTrainer:
         return audio_features, target_tokens
     
     def compute_loss(self, note_logits, time_logits, duration_logits, target_tokens):
-        """Compute combined loss"""
+        """Compute combined loss with improved weighting"""
         batch_size, seq_len = target_tokens.shape
-        
-        # For now, use simplified loss - just predict next note
-        # In a more sophisticated version, you'd separate note/time/duration targets
         
         # Shift targets for next-token prediction
         input_tokens = target_tokens[:, :-1]  # Input: all but last
@@ -263,8 +278,8 @@ class VoiceToNotesTrainer:
         note_logits_flat = note_logits.reshape(-1, note_logits.size(-1))
         targets_flat = target_tokens.reshape(-1)
         
-        # Compute loss
-        loss = self.note_loss_fn(note_logits_flat, targets_flat)
+        # IMPROVED: Use focal loss for better learning
+        loss = self.focal_loss(note_logits_flat, targets_flat)
         
         return loss
     
@@ -326,12 +341,15 @@ class VoiceToNotesTrainer:
             }
     
     def train_epoch(self, epoch):
-        """Train for one epoch"""
+        """Train for one epoch with gradient accumulation"""
         self.model.train()
         total_loss = 0
         total_metrics = {'token_accuracy': 0, 'note_accuracy': 0, 'pitch_tolerance_acc': 0, 'perplexity': 0}
         
         progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch}")
+        
+        # IMPROVED: Gradient accumulation for more stable training
+        self.optimizer.zero_grad()
         
         for batch_idx, batch in enumerate(progress_bar):
             try:
@@ -339,7 +357,6 @@ class VoiceToNotesTrainer:
                 audio_features, target_tokens = self.prepare_batch(batch)
                 
                 # Forward pass
-                self.optimizer.zero_grad()
                 note_logits, time_logits, duration_logits = self.model(
                     audio_features, target_tokens
                 )
@@ -347,36 +364,42 @@ class VoiceToNotesTrainer:
                 # Compute loss
                 loss = self.compute_loss(note_logits, time_logits, duration_logits, target_tokens)
                 
+                # Scale loss for gradient accumulation
+                loss = loss / self.gradient_accumulation_steps
+                
                 # Backward pass
                 loss.backward()
                 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                
-                # Optimizer step
-                self.optimizer.step()
-                self.scheduler.step()
+                # Gradient step every accumulation_steps
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    
+                    # Optimizer step
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
                 
                 # Compute metrics
                 metrics = self.compute_metrics(note_logits, time_logits, duration_logits, target_tokens)
                 
                 # Update totals
-                total_loss += loss.item()
+                total_loss += loss.item() * self.gradient_accumulation_steps  # Unscale for reporting
                 for key in total_metrics:
                     total_metrics[key] += metrics[key]
                 
                 # Update progress bar
                 progress_bar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
+                    'loss': f"{loss.item() * self.gradient_accumulation_steps:.4f}",
                     'note_acc': f"{metrics['note_accuracy']:.4f}",
                     'pitch_acc': f"{metrics['pitch_tolerance_acc']:.4f}",
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.6f}"
                 })
                 
                 # Log to wandb and local logger
-                if batch_idx % 10 == 0:
+                if batch_idx % (10 * self.gradient_accumulation_steps) == 0:
                     log_metrics = {
-                        'train/loss': loss.item(),
+                        'train/loss': loss.item() * self.gradient_accumulation_steps,
                         'train/token_accuracy': metrics['token_accuracy'],
                         'train/note_accuracy': metrics['note_accuracy'],
                         'train/pitch_tolerance_acc': metrics['pitch_tolerance_acc'],
@@ -394,6 +417,12 @@ class VoiceToNotesTrainer:
             except Exception as e:
                 print(f"Error in batch {batch_idx}: {e}")
                 continue
+        
+        # Final gradient step if needed
+        if len(self.train_dataloader) % self.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
         
         # Average metrics
         avg_loss = total_loss / len(self.train_dataloader)
@@ -475,13 +504,17 @@ class VoiceToNotesTrainer:
             torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_checkpoint.pt'))
             print(f"New best checkpoint saved with val_loss: {val_loss:.4f}")
     
-    def train(self, num_epochs, checkpoint_dir='checkpoints', save_every=5):
-        """Main training loop"""
+    def train(self, num_epochs, checkpoint_dir='checkpoints', save_every=5, patience=15):
+        """Main training loop with improved early stopping"""
         print(f"Starting training for {num_epochs} epochs")
         print(f"Training samples: {len(self.train_dataloader.dataset)}")
         print(f"Validation samples: {len(self.val_dataloader.dataset)}")
         
-        patience_counter = 0  # Initialize patience counter
+        # IMPROVED: More flexible early stopping criteria
+        best_combined_metric = 0.0  # Combination of low loss and high accuracy
+        no_improvement_epochs = 0
+        max_patience = patience  # Configurable patience
+        min_epochs = 3  # Minimum epochs before early stopping
         
         for epoch in range(num_epochs):
             # Train
@@ -492,30 +525,58 @@ class VoiceToNotesTrainer:
             val_loss, val_metrics = self.validate(epoch)
             self.val_losses.append(val_loss)
             
+            # IMPROVED: Combined metric for better early stopping
+            # Balance between low loss and high accuracy
+            combined_metric = val_metrics['note_accuracy'] - (val_loss * 0.1)
+            
+            # Check for improvement
+            improved = False
+            if val_loss < self.best_val_loss - self.min_improvement:
+                self.best_val_loss = val_loss
+                improved = True
+            
+            if val_metrics['note_accuracy'] > self.best_note_accuracy + self.min_improvement:
+                self.best_note_accuracy = val_metrics['note_accuracy']
+                improved = True
+            
+            if combined_metric > best_combined_metric + self.min_improvement:
+                best_combined_metric = combined_metric
+                improved = True
+            
+            if improved:
+                no_improvement_epochs = 0
+                print(f"📈 Improvement detected - resetting patience")
+            else:
+                no_improvement_epochs += 1
+            
             # Print epoch summary
             print(f"Epoch {epoch}: "
                   f"Train Loss: {train_loss:.4f}, "
                   f"Val Loss: {val_loss:.4f}, "
                   f"Note Acc: {train_metrics['note_accuracy']:.4f}/{val_metrics['note_accuracy']:.4f}, "
-                  f"Pitch Acc: {train_metrics['pitch_tolerance_acc']:.4f}/{val_metrics['pitch_tolerance_acc']:.4f}")
+                  f"Pitch Acc: {train_metrics['pitch_tolerance_acc']:.4f}/{val_metrics['pitch_tolerance_acc']:.4f}, "
+                  f"No improvement: {no_improvement_epochs}/{max_patience}")
             
             # Log epoch summary to local logger
             if self.local_logger:
                 self.local_logger.log_epoch_summary(epoch, train_loss, val_loss, train_metrics, val_metrics)
             
             # Save checkpoint
-            if epoch % save_every == 0 or epoch == num_epochs - 1:
+            if epoch % save_every == 0 or epoch == num_epochs - 1 or improved:
                 self.save_checkpoint(epoch, val_loss, checkpoint_dir)
             
-            # Early stopping with more aggressive patience for overfitting
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= 5:  # More aggressive early stopping
-                    print(f"Early stopping at epoch {epoch} due to overfitting")
-                    break
+            # IMPROVED: More intelligent early stopping
+            if epoch >= min_epochs and no_improvement_epochs >= max_patience:
+                print(f"🛑 Early stopping at epoch {epoch}")
+                print(f"   No improvement for {no_improvement_epochs} epochs")
+                print(f"   Best val loss: {self.best_val_loss:.4f}")
+                print(f"   Best note accuracy: {self.best_note_accuracy:.4f}")
+                break
+            
+            # Additional stopping criteria for very poor performance
+            if epoch >= 5 and val_metrics['note_accuracy'] < 0.05:
+                print(f"🛑 Stopping due to poor performance (note accuracy < 5%)")
+                break
 
 def main():
     parser = argparse.ArgumentParser(description='Train Voice-to-Notes Model')
@@ -548,6 +609,12 @@ def main():
                         help='Cache audio features for faster loading')
     parser.add_argument('--fast_dev', action='store_true',
                         help='Enable fast development mode (smaller model, fewer epochs)')
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
+                        help='Weight decay for regularization')
+    parser.add_argument('--grad_accum_steps', type=int, default=2,
+                        help='Gradient accumulation steps')
+    parser.add_argument('--patience', type=int, default=15,
+                        help='Early stopping patience')
     
     args = parser.parse_args()
     
@@ -633,22 +700,26 @@ def main():
         max_notes=100
     )
     
-    # Create trainer
+    # Create trainer with improved settings
     trainer = VoiceToNotesTrainer(
         model=model,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         device=device,
         lr=args.lr,
+        weight_decay=args.weight_decay,
+        max_grad_norm=0.5,  # Reduced gradient clipping for better learning
         wandb_manager=wandb_manager,
-        local_logger=local_logger
+        local_logger=local_logger,
+        gradient_accumulation_steps=args.grad_accum_steps
     )
     
     # Train
     trainer.train(
         num_epochs=args.epochs,
         checkpoint_dir=args.checkpoint_dir,
-        save_every=5
+        save_every=1,
+        patience=args.patience
     )
     
     # Finish wandb run

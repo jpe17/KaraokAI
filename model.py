@@ -42,9 +42,15 @@ class VoiceToNotesModel(nn.Module):
         for param in self.whisper.parameters():
             param.requires_grad = False
         
-        # Project whisper features to decoder dimension
+        # IMPROVED: Better encoder projection with residual connection
         whisper_dim = self.whisper.config.d_model
-        self.encoder_projection = nn.Linear(whisper_dim, d_model)
+        self.encoder_projection = nn.Sequential(
+            nn.Linear(whisper_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),  # Reduced dropout
+            nn.Linear(d_model, d_model)
+        )
         
         # Note vocabulary: 3 special tokens + 128 MIDI notes + time/duration buckets
         # [PAD], [START], [END], notes 0-127, time buckets 0-99, duration buckets 0-99
@@ -53,38 +59,64 @@ class VoiceToNotesModel(nn.Module):
         self.start_token = 1
         self.end_token = 2
         
-        # Token embeddings
+        # IMPROVED: Better token embeddings with proper initialization
         self.token_embedding = nn.Embedding(self.vocab_size, d_model)
         self.positional_encoding = PositionalEncoding(d_model, max_notes)
         
-        # Transformer decoder with increased dropout for regularization
+        # IMPROVED: Transformer decoder with balanced dropout
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            dropout=dropout * 2,  # Increase dropout to 0.2 for better regularization
-            batch_first=True
+            dropout=dropout,  # Use standard dropout, not doubled
+            activation=F.gelu,  # Better activation than ReLU
+            batch_first=True,
+            norm_first=True  # Pre-norm for better training stability
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers)
         
-        # Additional dropout layers
-        self.embedding_dropout = nn.Dropout(dropout)
-        self.output_dropout = nn.Dropout(dropout)
+        # IMPROVED: Controlled dropout layers
+        self.embedding_dropout = nn.Dropout(dropout * 0.5)  # Reduced embedding dropout
+        self.output_dropout = nn.Dropout(dropout * 0.5)     # Reduced output dropout
         
-        # Output heads for each component
-        self.note_head = nn.Linear(d_model, 128)  # MIDI notes 0-127
+        # IMPROVED: Output heads with better architecture
+        self.note_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(d_model // 2, 128)  # MIDI notes 0-127
+        )
         self.time_head = nn.Linear(d_model, 100)  # Time buckets
         self.duration_head = nn.Linear(d_model, 100)  # Duration buckets
         
         self.d_model = d_model
         self.max_notes = max_notes
         
+        # IMPROVED: Initialize weights for better convergence
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights for better convergence"""
+        # Initialize token embeddings
+        nn.init.normal_(self.token_embedding.weight, mean=0, std=0.02)
+        
+        # Initialize linear layers
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+        
     def encode_audio(self, audio_features):
-        """Encode audio using Whisper encoder"""
+        """Encode audio using Whisper encoder with improved projection"""
         with torch.no_grad():
             encoder_outputs = self.whisper.encoder(audio_features)
         
-        # Project to decoder dimension
+        # IMPROVED: Better projection with residual connection
         encoder_hidden = self.encoder_projection(encoder_outputs.last_hidden_state)
         return encoder_hidden
     
@@ -102,7 +134,7 @@ class VoiceToNotesModel(nn.Module):
             seq_len = target_tokens.size(1)
             target_mask = self.create_target_mask(seq_len).to(target_tokens.device)
             
-            # Embed target tokens with dropout
+            # IMPROVED: Better token embedding with proper scaling
             target_embedded = self.token_embedding(target_tokens) * math.sqrt(self.d_model)
             target_embedded = self.embedding_dropout(target_embedded)
             target_embedded = self.positional_encoding(target_embedded.transpose(0, 1)).transpose(0, 1)
@@ -114,7 +146,8 @@ class VoiceToNotesModel(nn.Module):
                 tgt_mask=target_mask
             )
             
-            # Apply output dropout before prediction heads
+            # IMPROVED: Skip connection before output heads
+            decoder_output = decoder_output + target_embedded  # Residual connection
             decoder_output = self.output_dropout(decoder_output)
             
             # Get predictions

@@ -8,8 +8,9 @@ import pretty_midi
 
 app = Flask(__name__)
 
-# Define the base directory for instrumentals
-INSTRUMENTAL_DIR = Path("03_data_preprocessing/instrumental")
+# Define the base directory for instrumentals (same directory as this script)
+SCRIPT_DIR = Path(__file__).parent
+INSTRUMENTAL_DIR = SCRIPT_DIR
 
 @app.route('/')
 def index():
@@ -22,9 +23,9 @@ def api_random_song():
     Finds a random song and returns its metadata and a URL to the instrumental audio.
     This endpoint is now extremely fast as it does no audio processing.
     """
-    notes_dir = Path("05_humanise_notes")
+    notes_dir = SCRIPT_DIR  # Frontend folder where script is located
     
-    if not notes_dir.exists() or not INSTRUMENTAL_DIR.exists():
+    if not INSTRUMENTAL_DIR.exists():
         return jsonify({"error": "Data directories not found on the server."}), 500
         
     note_files = list(notes_dir.glob("voice_*.csv"))
