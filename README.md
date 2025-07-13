@@ -176,7 +176,7 @@ MAX_SEQUENCE_LENGTH = 500  # Truncation for memory efficiency
 
 ### Installation
 ```bash
-git clone https://github.com/yourusername/KaraokeAI.git
+git clone https://github.com/jpe17/KaraokeAI.git
 cd KaraokeAI
 pip install -r requirements.txt
 ```
